@@ -11,6 +11,11 @@ import random
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from app.services.sample_dispatch import (
+    STATUS_DISPATCHED,
+    STATUS_WAITING,
+    dispatch_ledger,
+)
 from app.store import store
 
 # ---------------------------------------------------------------------------
@@ -366,99 +371,47 @@ def flow_version_to_online(version_mgr_id: int) -> list[FlowEffect]:
     return effects
 
 
-# ============================ 链路7: 样本分层→标注派发→标注审核→一致性计算 ============================
+# ============================ 链路7: 样本分层→标注派发（领取时落明细） ============================
 
 
 @_register(
-    "sample_strata/已出样 → label_task/派发任务 → label_review/确认通过 → consent_calc/启动计算",
-    desc="样本确认出样后派发标注任务，审核通过后自动触发一致性计算。",
+    "sample_strata/确认出样 → label_task/派发任务（待分配→标注中）",
+    desc="样本确认出样后登记领取请求；真正领取到待派发任务时才写样本派发明细，"
+         "池空时保持待分配，任务恢复后自动补派发。",
 )
 def flow_sample_to_label_to_review_to_consent(sample_strata_id: int) -> list[FlowEffect]:
+    """出样动作 → 派发清单的副作用投影。
+
+    真实写入已在 ``SampleStrataService`` 内通过 :class:`DispatchLedger` 完成，
+    这里只根据账本当前状态产出可追溯的链路效果，保证重复确认不会重复派发，
+    也不会改写已派发任务的编号和样本范围。
+    """
     effects: list[FlowEffect] = []
     ss = store.find("sample_strata", sample_strata_id)
     if ss is None or ss.get("status") != "已出样":
         return effects
 
-    strategy_no = str(ss.get("策略编号", ""))
-    sample_count = int(ss.get("样本数量", 10))
-
-    # 标注派发
-    label_task = _dispatch_label_task(strategy_no, sample_count, effects)
-
-    if label_task is None:
+    ledger = dispatch_ledger.find_by_strategy(sample_strata_id)
+    if ledger is None:
         return effects
 
-    # 模拟标注完成 → 审核通过
-    _label_review_pass(label_task, effects)
-    # 审核通过 → 一致性计算
-    _consent_calc_trigger(label_task, effects)
+    strategy_no = str(ledger.get("策略编号", ""))
+    if ledger.get("派发状态") == STATUS_DISPATCHED:
+        task_no = str(ledger.get("关联任务号", ""))
+        effects.append(FlowEffect(
+            "派发任务", "label_task",
+            int(ledger.get("出样id", 0)),
+            f"出样 {strategy_no} 的样本派发明细已落到标注任务 {task_no}，"
+            f"任务样本范围：{ledger.get('任务样本范围', '')}",
+        ))
+    else:
+        effects.append(FlowEffect(
+            "等待分配", "sample_strata", sample_strata_id,
+            f"出样 {strategy_no} 已登记领取请求，待派发池暂无可领取任务，"
+            f"当前状态：{STATUS_WAITING}",
+        ))
 
     return effects
-
-
-def _dispatch_label_task(
-    strategy_no: str, sample_count: int, effects: list[FlowEffect]
-) -> dict[str, Any] | None:
-    """派发标注任务。"""
-    label_rows = store.rows("label_task")
-    for lrow in label_rows:
-        if lrow.get("status") == "待派发":
-            lrow["status"] = "标注中"
-            lrow["pending"] = True
-            lrow["样本范围"] = f"样本{strategy_no}"
-            lrow["完成进度"] = "100%"
-            lrow["派发时间"] = datetime.datetime.now().isoformat()
-            lrow["triggered_by"] = f"sample_strata/{strategy_no}"
-            effects.append(FlowEffect(
-                "派发任务", "label_task", int(lrow.get("id", 0)),
-                f"样本 {strategy_no}({sample_count}条) 出样后派发标注任务 {lrow.get('任务编号','')}",
-            ))
-            return lrow
-    return None
-
-
-def _label_review_pass(label_task: dict[str, Any], effects: list[FlowEffect]):
-    """标注审核通过。"""
-    task_no = str(label_task.get("任务编号", ""))
-    review_rows = store.rows("label_review")
-    for rrow in review_rows:
-        if rrow.get("status") == "待审核":
-            rrow["status"] = "已通过"
-            rrow["pending"] = False
-            rrow["标注任务"] = task_no
-            rrow["样本数量"] = 30
-            rrow["通过数量"] = 29
-            rrow["驳回数量"] = 1
-            rrow["一致率"] = "96.7%"
-            rrow["审核时间"] = datetime.datetime.now().isoformat()
-            rrow["triggered_by"] = f"label_task/{task_no}"
-            effects.append(FlowEffect(
-                "确认通过", "label_review", int(rrow.get("id", 0)),
-                f"标注 {task_no} 审核通过，一致率 {rrow['一致率']}，触发一致性计算",
-            ))
-            break
-
-
-def _consent_calc_trigger(label_task: dict[str, Any], effects: list[FlowEffect]):
-    """审核通过后触发一致性计算。"""
-    task_no = str(label_task.get("任务编号", ""))
-    consent_rows = store.rows("consent_calc")
-    for crow in consent_rows:
-        if crow.get("status") == "待计算":
-            crow["status"] = "已出分"
-            crow["pending"] = False
-            crow["标注任务"] = task_no
-            kappa = round(random.uniform(0.75, 0.95), 3)
-            crow["Kappa系数"] = str(kappa)
-            crow["一致率"] = f"{round(kappa * 100, 1)}%"
-            crow["评估结论"] = "高一致性" if kappa > 0.8 else "中等一致性"
-            crow["计算时间"] = datetime.datetime.now().isoformat()
-            crow["triggered_by"] = f"label_review/{task_no}"
-            effects.append(FlowEffect(
-                "启动计算", "consent_calc", int(crow.get("id", 0)),
-                f"审核 {task_no} 通过后计算一致性，Kappa={kappa}",
-            ))
-            break
 
 
 # ============================ 链路8: 特征目录→治理审计→特征报告 ============================

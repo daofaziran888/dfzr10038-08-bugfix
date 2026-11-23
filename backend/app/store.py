@@ -14,6 +14,8 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        # 样本派发明细账本（sample_strata → label_task 的关联明细），初始为空
+        self._tables.setdefault("sample_dispatch", [])
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)

@@ -46,9 +46,25 @@
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
-          <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
-          <td>{{ row.status }}</td>
+        <tr
+          v-for="row in rows"
+          :key="String(row.id)"
+          :data-testid="`row-${row.id}`"
+          :data-status="String(row.status)"
+          :class="{ 'row-waiting': isWaitingRow(row) }"
+        >
+          <td v-for="column in meta.fields" :key="column" :data-field="column">
+            {{ row[column] || '—' }}
+          </td>
+          <td>
+            {{ row.status }}
+            <span v-if="isWaitingRow(row)" class="badge badge-waiting" data-testid="waiting-badge">
+              待分配
+            </span>
+            <span v-else-if="isDispatchedRow(row)" class="badge badge-done" data-testid="dispatched-badge">
+              已完成派发
+            </span>
+          </td>
           <td class="row-actions">
             <button
               v-for="action in meta.actions"
@@ -73,7 +89,7 @@
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记{{ meta.entity }}</h3>
-        <label v-for="field in meta.fields" :key="field" class="create-field">
+        <label v-for="field in createFields" :key="field" class="create-field">
           <span>{{ field }}</span>
           <input v-model="createValues[field]" :data-testid="`create-${field}`" required />
         </label>
@@ -88,6 +104,7 @@
 
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
+      <span v-if="actionMessage" class="info-text">{{ actionMessage }}</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
   </section>
@@ -107,9 +124,13 @@ import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+// 派发明细类字段由后端数据流写入，登记表单不要求手工填写
+const SYSTEM_FIELDS = new Set(['派发状态', '关联任务号', '任务样本范围', '关联策略号'])
+const createFields = meta.fields.filter((field) => !SYSTEM_FIELDS.has(field))
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
+const actionMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
@@ -145,9 +166,22 @@ async function exportRows() {
 }
 
 function openCreate() {
-  createValues.value = Object.fromEntries(meta.fields.map((field) => [field, '']))
+  createValues.value = Object.fromEntries(createFields.map((field) => [field, '']))
   errorMessage.value = ''
   showCreate.value = true
+}
+
+function isWaitingRow(row: EntryRow): boolean {
+  // 样本分层：已确认出样但还没领到任务；标注派发：任务仍在待派发池
+  if (props.moduleKey === 'sample_strata') return row['派发状态'] === '待分配'
+  if (props.moduleKey === 'label_task') return row.status === '待派发'
+  return false
+}
+
+function isDispatchedRow(row: EntryRow): boolean {
+  if (props.moduleKey === 'sample_strata') return row['派发状态'] === '已完成派发'
+  if (props.moduleKey === 'label_task') return row.status === '标注中'
+  return false
 }
 
 async function submitCreate() {
@@ -170,6 +204,7 @@ async function runAction(action: string, row: EntryRow) {
   try {
     const result = await applyAction(meta.key, Number(row.id), action)
     if (!result.ok) throw new Error(result.message)
+    actionMessage.value = result.message
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'

@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import service_for
 from app.services.data_flow import FlowEffect, FLOW_TRIGGERS, flow_engine
+from app.services.sample_dispatch import dispatch_ledger
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
 
@@ -20,6 +21,31 @@ def require_service(module: str):
     if service is None:
         raise HTTPException(status_code=404, detail=f"未知业务模块：{module}")
     return service
+
+
+@router.get("/sample-dispatch/ledger")
+def get_dispatch_ledger(status: str | None = Query(default=None)) -> dict[str, Any]:
+    """样本派发明细账本：区分待分配与已完成派发，可追溯关联任务号与样本范围。"""
+    rows = dispatch_ledger.rows()
+    if status:
+        rows = [row for row in rows if row.get("派发状态") == status]
+    return {
+        "items": rows,
+        "total": len(rows),
+        "waiting": len(dispatch_ledger.waiting_queue()),
+        "dispatched": len(dispatch_ledger.dispatched_rows()),
+    }
+
+
+@router.get("/sample-dispatch/waiting-pool")
+def get_waiting_pool() -> dict[str, Any]:
+    """待派发任务池 + 待分配出样队列：用于核对两个页面的交付结果。"""
+    label_rows = service_for("label_task").list_entries(page=1, size=200)[0]
+    pool = [row for row in label_rows if row.get("status") == "待派发"]
+    return {
+        "pending_tasks": pool,
+        "waiting_releases": dispatch_ledger.waiting_queue(),
+    }
 
 
 @router.get("/{module}", response_model=PageResult[dict])
